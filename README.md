@@ -1,2 +1,2 @@
-# Concurrent_Disk_Benchmark
-Measures disk read/write bandwidth on single process/multithread/multiproc situations
+# Concurrent Disk Benchmark
+Measures multiprocess, multithreaded disk writing bandwidth

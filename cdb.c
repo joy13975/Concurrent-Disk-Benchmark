@@ -12,6 +12,7 @@
 #include <sys/types.h>      //ftruncate
 #include <sys/mman.h>       //mmap
 #include <sys/time.h>       //gettimeofday
+#include <stdint.h>     //uint8_t
 
 #include "mpi.h"
 #include "omp.h"
@@ -32,6 +33,7 @@ struct
     int                         nitrs;
     bool                        new_file_per_write;
     bool                        first_file_setup;
+    int                         nranks;
     int                         my_rank;
 } params = {0};
 
@@ -54,8 +56,8 @@ int main(int argc, char *argv[])
 
     double sum_write_ms = 0;
 
-    int i, nthreads, nranks;
-    MPI_Comm_size(MPI_COMM_WORLD, &nranks);
+    int i, nthreads;
+    MPI_Comm_size(MPI_COMM_WORLD, &(params.nranks));
 
     #pragma omp parallel private(i) reduction(+: sum_write_ms)
     {
@@ -71,9 +73,12 @@ int main(int argc, char *argv[])
         for (i = 0; i < params.nitrs; i++)
         {
             if (!params.my_rank && !tid)
+            {
                 printf("Iteration #%d\n", i);
+                fflush(stdout);
+            }
+
             thread_sum_write_ms += do_write_benchmark(&fd, &file_ptr);
-            #pragma omp barrier
         }
 
         sum_write_ms += thread_sum_write_ms;
@@ -86,9 +91,14 @@ int main(int argc, char *argv[])
     MPI_Reduce(&sum_write_ms, &global_sum_write_ms, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (!params.my_rank)
+    {
         printf("\nAverage disk write bandwidtch: %10.2f MB/s\n",
-               (double) params.size_in_mb * nthreads * nranks
-               / (global_sum_write_ms / nthreads / nranks / params.nitrs / 1000));
+               (double) params.size_in_mb * nthreads * params.nranks
+               / (global_sum_write_ms / nthreads / params.nranks / params.nitrs / 1000));
+        printf("Size in mb: %lu, NThreads: %d, NRanks: %d, Global time in ms: %.2f, NItrs: %d\n",
+               params.size_in_mb, nthreads, params.nranks, global_sum_write_ms, params.nitrs);
+    }
+
 
     finalize();
     return 0;
@@ -113,6 +123,7 @@ double do_write_benchmark(int *fd_ptr, byte **file_ptr_ptr)
     if ((mem_ptr = malloc(params.total_bytes)) == NULL)
         die("Could not allocate memory data source: %s\n", errstr());
 
+    #pragma omp single
     MPI_Barrier(MPI_COMM_WORLD);
 
     double t1 = get_unix_ms();
@@ -125,15 +136,24 @@ double do_write_benchmark(int *fd_ptr, byte **file_ptr_ptr)
 
     double diff = get_unix_ms() - t1;
 
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    #pragma omp critical
+    for (int i = 0; i < params.nranks; i++)
     {
-        printf("[R-%d-", params.my_rank);
-        printf("T-%d] ", omp_get_thread_num());
+        if (i == params.my_rank)
+        {
+            #pragma omp single
+            {
+                printf("[R-%d-", params.my_rank);
+                printf("T-%d] ", omp_get_thread_num());
+                printf("Writing %llu bytes (%lu MB) took %.2f ms\n",
+                params.total_bytes, params.size_in_mb, diff);
+            }
+        }
 
-        printf("Writing %llu bytes (%lu MB) took \t%.2f ms\n",
-               params.total_bytes, params.size_in_mb, diff);
+        #pragma omp single
+        MPI_Barrier(MPI_COMM_WORLD);
+        fflush(stdout);
+        #pragma omp single
+        MPI_Barrier(MPI_COMM_WORLD);
     }
 
     if (params.new_file_per_write)
@@ -209,7 +229,7 @@ void print_help()
     printf("    Arguments:\n");
     printf("        -s, --size <mb>     : Specify the size in Mega Bytes to read/write\n");
     printf("        -d, --dest <file>   : Specify the destination file for read/write\n");
-    printf("        -i, --itrs <n>      : Specify the number of iterations to avergae over (default: 1)\n");
+    printf("        -i, --itrs <n>      : Specify the number of iterations to avergae over (default: 10)\n");
     printf("        -n, --new           : Enable creating new file before every write (default: off)\n");
     printf("        -h, --help          : Show this help message\n");
     printf("\n");
@@ -280,7 +300,7 @@ void parse_arguments(int argc, char *argv[])
         printf("Destination file not provided\n");
 
     if (params.nitrs == 0)
-        params.nitrs = 1;
+        params.nitrs = 10;
 
     if (!pass)
     {

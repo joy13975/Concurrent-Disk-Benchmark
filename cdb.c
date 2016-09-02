@@ -59,7 +59,7 @@ int main(int argc, char *argv[])
     int i, nthreads;
     MPI_Comm_size(MPI_COMM_WORLD, &(params.nranks));
 
-    #pragma omp parallel private(i) reduction(+: sum_write_ms)
+    #pragma omp parallel private(i)
     {
         nthreads = omp_get_num_threads();
         int tid = omp_get_thread_num();
@@ -81,22 +81,23 @@ int main(int argc, char *argv[])
             thread_sum_write_ms += do_write_benchmark(&fd, &file_ptr);
         }
 
-        sum_write_ms += thread_sum_write_ms;
+        if (!params.my_rank && !tid)
+            sum_write_ms += thread_sum_write_ms;
 
         if (!params.new_file_per_write)
             finalize_file(&fd, &file_ptr);
     }
 
-    double global_sum_write_ms = 0.0f;
-    MPI_Reduce(&sum_write_ms, &global_sum_write_ms, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    // double global_sum_write_ms = 0.0f;
+    // MPI_Reduce(&sum_write_ms, &global_sum_write_ms, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (!params.my_rank)
     {
         printf("\nAverage disk write bandwidtch: %10.2f MB/s\n",
-               (double) params.size_in_mb * nthreads * params.nranks
-               / (global_sum_write_ms / nthreads / params.nranks / params.nitrs / 1000));
-        printf("Size in mb: %lu, NThreads: %d, NRanks: %d, Global time in ms: %.2f, NItrs: %d\n",
-               params.size_in_mb, nthreads, params.nranks, global_sum_write_ms, params.nitrs);
+               (double) params.size_in_mb * nthreads * params.nranks * params.nitrs
+               / (sum_write_ms / 1000));
+        printf("Size in mb: %lu, NThreads: %d, NRanks: %d, Total write time in ms: %.2f, NItrs: %d\n",
+               params.size_in_mb, nthreads, params.nranks, sum_write_ms, params.nitrs);
     }
 
 
@@ -123,10 +124,18 @@ double do_write_benchmark(int *fd_ptr, byte **file_ptr_ptr)
     if ((mem_ptr = malloc(params.total_bytes)) == NULL)
         die("Could not allocate memory data source: %s\n", errstr());
 
+    //write random stuff in the memory
+    for(int i = 0; i < params.total_bytes-8; i+=8)
+        mem_ptr[i] = 0xde;
+
+    int tid = omp_get_thread_num();
+
     #pragma omp single
     MPI_Barrier(MPI_COMM_WORLD);
 
-    double t1 = get_unix_ms();
+    double t1 = 0.0f;
+    if (!params.my_rank && !tid)
+        t1 = get_unix_ms();
 
     //copy memory data source into file mapped in memory
     memcpy(*file_ptr_ptr, mem_ptr, params.total_bytes);
@@ -134,26 +143,19 @@ double do_write_benchmark(int *fd_ptr, byte **file_ptr_ptr)
     //sync changes to file
     msync(*file_ptr_ptr, params.total_bytes, MS_SYNC);
 
-    double diff = get_unix_ms() - t1;
+    #pragma omp single
+    MPI_Barrier(MPI_COMM_WORLD);
 
-    for (int i = 0; i < params.nranks; i++)
+    double diff = 0.0f;
+    if (!params.my_rank && !tid)
+        diff = get_unix_ms() - t1;
+
+    if (!params.my_rank && !tid)
     {
-        if (i == params.my_rank)
-        {
-            #pragma omp single
-            {
-                printf("[R-%d-", params.my_rank);
-                printf("T-%d] ", omp_get_thread_num());
-                printf("Writing %llu bytes (%lu MB) took %.2f ms\n",
-                params.total_bytes, params.size_in_mb, diff);
-            }
-        }
-
-        #pragma omp single
-        MPI_Barrier(MPI_COMM_WORLD);
-        fflush(stdout);
-        #pragma omp single
-        MPI_Barrier(MPI_COMM_WORLD);
+        printf("[R-%d-", params.my_rank);
+        printf("T-%d] ", omp_get_thread_num());
+        printf("Writing %llu bytes (%lu MB) took %.2f ms\n",
+               params.total_bytes, params.size_in_mb, diff);
     }
 
     if (params.new_file_per_write)
@@ -207,7 +209,7 @@ void setup_file(int *fd_ptr, byte **file_ptr_ptr)
                 mmap(0,
                      params.total_bytes,
                      PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE,
+                     MAP_SHARED,
                      *fd_ptr,
                      0)
         ) == NULL)
